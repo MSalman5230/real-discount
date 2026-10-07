@@ -114,8 +114,13 @@ default. Files are created only when explicitly requested with
 | `./data` | `/data` (read/write) | Telegram session, group binding, lock and small reading checkpoint. |
 | RAM mount (64 MiB limit) | `/tmp` | Temporary files and Matplotlib font cache; discarded when the container stops. |
 
-To store data in another directory, change the `source: ./data` value in
-`compose.yaml` to that directory's absolute path. Keep its target as `/data`.
+Compose uses short mount syntax: `host-path:container-path`, with `:ro`
+for the read-only configuration file. The `/data` mount holds only the saved
+login and restart metadata; product processing stays in memory.
+
+To store that state in another directory, replace the host side of
+`./data:/data` with its absolute path, for example
+`/mnt/user/appdata/real-discount:/data`. Keep the container target as `/data`.
 Use a local filesystem that supports SQLite and file locks, and keep one
 monitor running per session/data directory. No port mapping is needed.
 
