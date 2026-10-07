@@ -8,7 +8,7 @@ services:
     restart: unless-stopped
     # Matplotlib's font cache and temporary files stay in RAM.
     tmpfs:
-      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+      - /tmp:rw,noexec,nosuid,size=256m,mode=1777
     # Telegram delivery is the output; do not archive console logs on disk.
     logging:
       driver: none
