@@ -5,6 +5,8 @@ Uses PriceHistory.app's six-month time-weighted median to identify discounts.
 Sends you a Telegram graph, percentage drop and available buying assessment
 only when the price is **more than 20% below the median** (configurable).
 Messages are processed once, including across restarts.
+After downtime, catch-up is limited to unclaimed messages from the past
+30 minutes; older messages are skipped without scanning the entire backlog.
 Product histories, graphs and captions are processed in memory and released
 after sending; the monitor does not save report files or processed messages.
 
@@ -91,8 +93,10 @@ small JSON reading checkpoint persist. The checkpoint contains the group ID
 and last claimed message ID, never product data or links, and stays under
 100 bytes for normal Telegram message IDs. It is saved before processing
 each message to prevent replay after a restart. As before, a crash during
-processing can interrupt that message's delivery; unclaimed messages are
-fetched again from Telegram. Dry runs do not advance the real checkpoint.
+processing can interrupt that message's delivery; unclaimed messages from
+the past 30 minutes are fetched again from Telegram. At each startup, a
+server-side date lookup advances stale checkpoints past older messages.
+Dry runs do not advance the real checkpoint.
 Telegram's encountered-user/chat cache is disabled.
 
 Docker Compose mounts `/tmp` in RAM for Matplotlib's font cache and temporary
@@ -215,7 +219,8 @@ above if needed. This preserves the login and processed-message state.
 Do not run the local and Docker monitors simultaneously.
 
 On the first upgraded run, the previous SQLite inbox is read to recover the
-message cursor and any unclaimed messages; it is then left unused. Once that
+message cursor; unclaimed messages are recovered only within the past
+30 minutes, and the old inbox is then left unused. Once that
 run has created a checkpoint with `"version":1`, old inbox databases, their
 sidecar files, `telegram-state.json`, saved report directories and old graph
 caches can be removed while the monitor is stopped. Keep

@@ -9,6 +9,7 @@ import re
 import sys
 import time
 import unicodedata
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -28,6 +29,7 @@ READ_STATE_PATH = DATA_DIR / "results" / "telegram-read-state.json"
 INBOX_PATH = DATA_DIR / "results" / "telegram-inbox.sqlite3"
 AUTHORIZED_SOURCE = "https://t.me/+RMtFLhPbWG9Hn0MQ"
 AUTHORIZED_GROUP_NAME = "DealAlerts🔔 Loot Deals"
+RESTART_LOOKBACK = timedelta(minutes=30)
 
 
 def authorized_source(value):
@@ -171,6 +173,27 @@ def message_links(message):
     return extract_links(message.message, message.entities, buttons)
 
 
+async def open_inbox(client, entity, chat_id, *, persist=True):
+    """Resume unclaimed messages, skipping history older than 30 minutes."""
+    state = json.loads(READ_STATE_PATH.read_text(encoding="utf-8")) if READ_STATE_PATH.exists() else {}
+    if state and state.get("chat_id") != chat_id:
+        raise ValueError("Stored reading cursor belongs to a different group.")
+    last_id = state.get("last_message_id")
+    if last_id is None:
+        newest = await client.get_messages(entity, limit=1)
+        last_id = newest[0].id if newest else 0
+    cutoff = datetime.now(timezone.utc).replace(microsecond=0) - RESTART_LOOKBACK
+    # Resolve the date to one boundary ID on the server, so the ascending
+    # iterator never walks the outage backlog. Telethon prioritizes min_id
+    # over offset_date when both are supplied.
+    older = await client.get_messages(entity, limit=1, offset_date=cutoff)
+    if older and older[0].chat_id != chat_id:
+        raise ValueError("Refusing to inspect a message outside the approved group.")
+    return MessageQueue(READ_STATE_PATH, chat_id, last_id,
+                        legacy_path=INBOX_PATH, persist=persist,
+                        minimum_cursor=older[0].id if older else 0)
+
+
 async def capture_new_messages(client, entity, chat_id, inbox, wake, worker=None):
     count = 0
     # limit=None lets Telethon paginate every new message, not just one or 100.
@@ -245,18 +268,10 @@ async def read_group(args):
             GROUP_BINDING_PATH.write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Verified approved group: {entity.title} (ID {chat_id}).", flush=True)
         processor = DeliveryProcessor(args.dry_run)
-        state = json.loads(READ_STATE_PATH.read_text(encoding="utf-8")) if READ_STATE_PATH.exists() else {}
-        if state and state.get("chat_id") != chat_id:
-            raise ValueError("Stored reading cursor belongs to a different group.")
-        last_id = state.get("last_message_id")
-        if last_id is None:
-            newest = await client.get_messages(entity, limit=1)
-            last_id = newest[0].id if newest else 0
-        inbox = MessageQueue(READ_STATE_PATH, chat_id, last_id,
-                             legacy_path=INBOX_PATH, persist=not args.dry_run)
+        inbox = await open_inbox(client, entity, chat_id, persist=not args.dry_run)
         wake = asyncio.Event()
         worker = asyncio.create_task(process_inbox(inbox, processor, wake))
-        print(f"Group-only polling: {entity.title}. Bounded RAM inbox; only a small restart cursor is saved. Alerts only above the .env threshold.", flush=True)
+        print(f"Group-only polling: {entity.title}. Restart catch-up limited to the past 30 minutes. Bounded RAM inbox; only a small restart cursor is saved. Alerts only above the .env threshold.", flush=True)
         try:
             while True:
                 if worker.done():
@@ -297,7 +312,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("discover", help="Check bot identity and available delivery chat IDs")
     watch = subparsers.add_parser("watch", help="Read only configured groups through your Telegram user session")
-    watch.add_argument("--once", action="store_true", help="Drain all new messages since the durable cursor and exit")
+    watch.add_argument("--once", action="store_true", help="Drain new messages with restart catch-up limited to 30 minutes, then exit")
     watch.add_argument("--dry-run", action="store_true", help="Generate reports without sending them")
     watch.add_argument("--poll-seconds", type=float, default=None,
                        help="Override .env polling interval (minimum 1)")

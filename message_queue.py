@@ -11,9 +11,11 @@ from pathlib import Path
 
 class MessageQueue:
     def __init__(self, path, group_id, initial_cursor=0, *, legacy_path=None,
-                 persist=True, max_pending=256):
+                 persist=True, max_pending=256, minimum_cursor=0):
         if max_pending < 1:
             raise ValueError("The inbox capacity must be positive.")
+        if not isinstance(minimum_cursor, int) or minimum_cursor < 0:
+            raise ValueError("The minimum cursor must be a non-negative message ID.")
         self.group_id = group_id
         self.path = Path(path)
         self.persist = persist
@@ -31,9 +33,11 @@ class MessageQueue:
             cursor = self._legacy_cursor(Path(legacy_path))
         if not isinstance(cursor, int) or cursor < 0:
             raise ValueError("Stored reading cursor must be a non-negative message ID.")
+        saved_cursor = cursor
+        cursor = max(cursor, minimum_cursor)
         self.committed_cursor = cursor
         self.scan_cursor = cursor
-        if not state or state.get("version") != 1:
+        if not state or state.get("version") != 1 or cursor != saved_cursor:
             self._save_cursor(cursor, force=True)
 
     def _legacy_cursor(self, path):
