@@ -1,69 +1,107 @@
-"""Durable inbox keyed by approved group/message ID; capture and claim once."""
+"""Keep pending messages in RAM and persist only a small restart cursor."""
 
 import json
+import os
 import sqlite3
 import threading
+from collections import deque
+from contextlib import closing
 from pathlib import Path
 
 
 class MessageQueue:
-    def __init__(self, path, group_id, initial_cursor=0):
+    def __init__(self, path, group_id, initial_cursor=0, *, legacy_path=None,
+                 persist=True, max_pending=256):
+        if max_pending < 1:
+            raise ValueError("The inbox capacity must be positive.")
         self.group_id = group_id
+        self.path = Path(path)
+        self.persist = persist
+        self.max_pending = max_pending
         self.lock = threading.RLock()
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(path), check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.executescript('''
-            CREATE TABLE IF NOT EXISTS scope (group_id INTEGER PRIMARY KEY, cursor INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS messages (
-                group_id INTEGER NOT NULL, message_id INTEGER NOT NULL, links TEXT NOT NULL,
-                status TEXT NOT NULL, detail TEXT, PRIMARY KEY (group_id, message_id));
-        ''')
-        rows = self.db.execute("SELECT group_id FROM scope").fetchall()
-        if rows and any(row[0] != group_id for row in rows):
-            raise ValueError("Inbox database belongs to a different group.")
-        self.db.execute("INSERT OR IGNORE INTO scope VALUES (?, ?)", (group_id, initial_cursor))
-        # Never replay a message already claimed by a previous process. A crash
-        # may interrupt delivery, but retrying would risk duplicate messages.
-        self.db.execute("UPDATE messages SET status='interrupted', detail='Previous worker stopped during processing' WHERE status='processing'")
-        self.db.commit()
+        self.pending = deque()
+        self.active = None
+        state = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+        if state and state["chat_id"] != group_id:
+            raise ValueError("Stored reading cursor belongs to a different group.")
+        cursor = state.get("last_message_id", initial_cursor)
+        # Older versions kept a SQLite inbox. Recover its pending messages from
+        # Telegram, without loading payloads or writing to the old database.
+        if legacy_path and Path(legacy_path).exists() and state.get("version") != 1:
+            cursor = self._legacy_cursor(Path(legacy_path))
+        if not isinstance(cursor, int) or cursor < 0:
+            raise ValueError("Stored reading cursor must be a non-negative message ID.")
+        self.committed_cursor = cursor
+        self.scan_cursor = cursor
+        if not state or state.get("version") != 1:
+            self._save_cursor(cursor, force=True)
+
+    def _legacy_cursor(self, path):
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            scopes = db.execute("SELECT group_id, cursor FROM scope").fetchall()
+            if len(scopes) != 1 or scopes[0][0] != self.group_id:
+                raise ValueError("Inbox database belongs to a different group.")
+            cursor = scopes[0][1]
+            pending = db.execute("SELECT MIN(message_id) FROM messages WHERE status='pending'").fetchone()[0]
+            return min(cursor, pending - 1) if pending is not None else cursor
+
+    def _save_cursor(self, cursor, *, force=False):
+        if cursor == self.committed_cursor and not force:
+            return
+        if self.persist:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(".tmp")
+            state = {"version": 1, "chat_id": self.group_id, "last_message_id": cursor}
+            with temporary.open("w", encoding="utf-8") as stream:
+                stream.write(json.dumps(state, separators=(",", ":")))
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(self.path)
+        self.committed_cursor = cursor
 
     def cursor(self):
         with self.lock:
-            return self.db.execute("SELECT cursor FROM scope WHERE group_id=?", (self.group_id,)).fetchone()[0]
+            return self.scan_cursor
+
+    def full(self):
+        return self.remaining() >= self.max_pending
 
     def capture(self, group_id, message_id, links):
         if group_id != self.group_id:
             raise ValueError("Refusing to queue a message outside the approved group.")
-        with self.lock, self.db:
-            inserted = self.db.execute("INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, NULL)",
-                                       (group_id, message_id, json.dumps(links), "pending" if links else "no_links")).rowcount
-            self.db.execute("UPDATE scope SET cursor=MAX(cursor, ?) WHERE group_id=?", (message_id, group_id))
-            return bool(inserted)
+        with self.lock:
+            if message_id <= self.scan_cursor:
+                return False
+            if self.full():
+                raise ValueError("The in-memory inbox is full.")
+            self.pending.append({"group_id": group_id, "message_id": message_id,
+                                 "links": list(links)})
+            self.scan_cursor = message_id
+            return True
 
     def claim(self):
         with self.lock:
-            self.db.execute("BEGIN IMMEDIATE")
-            try:
-                row = self.db.execute("SELECT * FROM messages WHERE status='pending' ORDER BY message_id LIMIT 1").fetchone()
-                if row is not None:
-                    self.db.execute("UPDATE messages SET status='processing' WHERE group_id=? AND message_id=?",
-                                    (row["group_id"], row["message_id"]))
-                self.db.commit()
-            except Exception:
-                self.db.rollback()
-                raise
-            return {**dict(row), "links": json.loads(row["links"])} if row is not None else None
+            if self.active is not None or not self.pending:
+                return None
+            job = self.pending[0]
+            # Claim before sending, preserving the existing policy: a crash can
+            # interrupt an alert, but cannot replay an already claimed message.
+            self._save_cursor(job["message_id"])
+            self.active = self.pending.popleft()
+            return self.active
 
     def remaining(self):
         with self.lock:
-            return self.db.execute("SELECT COUNT(*) FROM messages WHERE status IN ('pending','processing')").fetchone()[0]
+            return len(self.pending) + (self.active is not None)
 
     def finish(self, message_id, outcomes):
-        with self.lock, self.db:
-            self.db.execute("UPDATE messages SET status='done', detail=? WHERE group_id=? AND message_id=?",
-                            (json.dumps(outcomes), self.group_id, message_id))
+        with self.lock:
+            if self.active is None or self.active["message_id"] != message_id:
+                raise ValueError("Only the active message can be finished.")
+            # No processed links, product histories or delivery details retained.
+            self.active = None
 
     def close(self):
-        self.db.close()
+        with self.lock:
+            self.pending.clear()
+            self.active = None

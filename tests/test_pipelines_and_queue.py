@@ -1,5 +1,7 @@
 import asyncio
 import json
+import sqlite3
+from io import BytesIO
 import subprocess
 import sys
 import tempfile
@@ -75,49 +77,66 @@ class ThresholdTests(unittest.TestCase):
         processor = DeliveryProcessor.__new__(DeliveryProcessor)
         processor.bot = Mock()
         processor.recipient = 'private'
-        processor.state = {'sent': []}
         result = {'product_id': 'PRODUCT', 'six_month_analysis': {'median_rule_verdict': 'WAIT', 'drop_percent': 20}}
         with patch('telegram_monitor.read_settings', return_value=Settings()), \
              patch('telegram_monitor.prepare_report', return_value=result), \
-             patch('telegram_monitor.save_report') as save:
+             patch('telegram_monitor.render_graph') as render:
             outcome = processor.process(-100123, 1, ['https://fkrt.co/test'])
         self.assertEqual(outcome[0]['status'], 'below_threshold')
-        save.assert_not_called()
+        render.assert_not_called()
         processor.bot.send_report.assert_not_called()
 
     def test_invalid_link_does_not_stop_other_links_in_post(self):
         processor = DeliveryProcessor.__new__(DeliveryProcessor)
         processor.bot = None
-        processor.state = {'sent': []}
         good = {'product_id': 'PRODUCT', 'six_month_analysis': {'median_rule_verdict': 'WAIT', 'drop_percent': 10}}
         with patch('telegram_monitor.read_settings', return_value=Settings()), \
              patch('telegram_monitor.prepare_report', side_effect=[PriceHistoryError('No data', 'no_history'), good]):
             results = processor.process(-100123, 1, ['https://fkrt.co/bad', 'https://fkrt.co/good'])
         self.assertEqual([r['status'] for r in results], ['failed', 'below_threshold'])
 
-    def test_qualifying_message_uses_configured_threshold_and_sends_graph(self):
+    def test_qualifying_message_sends_and_closes_a_memory_graph_without_writing(self):
         processor = DeliveryProcessor.__new__(DeliveryProcessor)
         processor.bot = Mock()
         processor.recipient = 'private'
-        processor.state = {'sent': []}
         result = {'product_id': 'PRODUCT', 'six_month_analysis': {'median_rule_verdict': 'BUY', 'drop_percent': 26}}
         url = 'https://fkrt.co/good'
-        with tempfile.TemporaryDirectory() as directory, \
-             patch('telegram_monitor.STATE_PATH', Path(directory) / 'state.json'), \
-             patch('telegram_monitor.read_settings', return_value=Settings(threshold=25)), \
+        graph = BytesIO(b'png bytes')
+        uploaded = []
+        processor.bot.send_report.side_effect = lambda recipient, photo, caption: uploaded.append(photo.read())
+        with patch('telegram_monitor.read_settings', return_value=Settings(threshold=25)), \
              patch('telegram_monitor.prepare_report', return_value=result) as prepare, \
-             patch('telegram_monitor.save_report', return_value=(result, Path('graph.png'), 'caption')):
-            outcome = processor.process(-100123, 1, [url])
-            prepare.assert_called_once_with(url, 6, 25)
-            processor.bot.send_report.assert_called_once_with('private', Path('graph.png'), 'caption')
-            self.assertEqual(outcome[0]['status'], 'sent')
-            self.assertEqual(len(json.loads((Path(directory) / 'state.json').read_text())['sent']), 1)
+             patch('telegram_monitor.report_caption', return_value='caption'), \
+             patch('telegram_monitor.render_graph', return_value=graph), \
+             patch.object(Path, 'write_text', side_effect=AssertionError('Unexpected disk write')), \
+             patch.object(Path, 'mkdir', side_effect=AssertionError('Unexpected directory')):
+            outcome = processor.process(-100123, 1, [url, url])
+        prepare.assert_called_once_with(url, 6, 25)
+        processor.bot.send_report.assert_called_once_with('private', graph, 'caption')
+        self.assertEqual(uploaded, [b'png bytes'])
+        self.assertTrue(graph.closed)
+        self.assertEqual(outcome[0]['status'], 'sent')
+
+    def test_upload_failure_releases_the_graph_and_continues_to_the_next_link(self):
+        processor = DeliveryProcessor.__new__(DeliveryProcessor)
+        processor.bot = Mock()
+        processor.bot.send_report.side_effect = [ValueError('upload failed'), None]
+        processor.recipient = 'private'
+        result = {'product_id': 'PRODUCT', 'six_month_analysis': {'median_rule_verdict': 'BUY', 'drop_percent': 26}}
+        graphs = [BytesIO(b'first'), BytesIO(b'second')]
+        with patch('telegram_monitor.read_settings', return_value=Settings()), \
+             patch('telegram_monitor.prepare_report', return_value=result), \
+             patch('telegram_monitor.report_caption', return_value='caption'), \
+             patch('telegram_monitor.render_graph', side_effect=graphs):
+            outcomes = processor.process(-100123, 1, ['https://fkrt.co/first', 'https://fkrt.co/second'])
+        self.assertEqual([item['status'] for item in outcomes], ['failed', 'sent'])
+        self.assertTrue(all(graph.closed for graph in graphs))
 
 
 class InboxTests(unittest.TestCase):
     def test_every_message_in_a_large_poll_is_captured_once(self):
         with tempfile.TemporaryDirectory() as directory:
-            inbox = MessageQueue(Path(directory) / 'inbox.sqlite3', -100123)
+            inbox = MessageQueue(Path(directory) / 'cursor.json', -100123)
 
             class Client:
                 def iter_messages(self, entity, **kwargs):
@@ -140,14 +159,14 @@ class InboxTests(unittest.TestCase):
                 inbox.finish(job['message_id'], [{'status': 'below_threshold'}])
             self.assertEqual(ids, list(range(1, 151)))
             inbox.close()
-            reopened = MessageQueue(Path(directory) / 'inbox.sqlite3', -100123)
+            reopened = MessageQueue(Path(directory) / 'cursor.json', -100123)
             self.assertFalse(reopened.capture(-100123, 1, ['https://fkrt.co/example']))
             self.assertIsNone(reopened.claim())
             reopened.close()
 
     def test_claimed_message_is_not_replayed_after_a_crash(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'inbox.sqlite3'
+            path = Path(directory) / 'cursor.json'
             inbox = MessageQueue(path, -100123)
             inbox.capture(-100123, 1, ['https://fkrt.co/example'])
             self.assertIsNotNone(inbox.claim())
@@ -156,21 +175,23 @@ class InboxTests(unittest.TestCase):
             self.assertIsNone(reopened.claim())
             reopened.close()
 
-    def test_pending_messages_survive_restart_and_wrong_group_is_rejected(self):
+    def test_pending_messages_can_be_refetched_after_restart_and_wrong_group_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'inbox.sqlite3'
+            path = Path(directory) / 'cursor.json'
             inbox = MessageQueue(path, -100123)
             with self.assertRaises(ValueError):
                 inbox.capture(-100999, 1, ['https://fkrt.co/example'])
             inbox.capture(-100123, 1, ['https://fkrt.co/example'])
             inbox.close()
             reopened = MessageQueue(path, -100123)
+            self.assertEqual(reopened.cursor(), 0)
+            self.assertTrue(reopened.capture(-100123, 1, ['https://fkrt.co/example']))
             self.assertEqual(reopened.claim()['message_id'], 1)
             reopened.close()
 
     def test_worker_processes_every_message_even_after_an_unexpected_error(self):
         with tempfile.TemporaryDirectory() as directory:
-            inbox = MessageQueue(Path(directory) / 'inbox.sqlite3', -100123)
+            inbox = MessageQueue(Path(directory) / 'cursor.json', -100123)
             for number in range(1, 4):
                 inbox.capture(-100123, number, ['https://fkrt.co/example'])
             processor = Mock()
@@ -191,6 +212,105 @@ class InboxTests(unittest.TestCase):
             self.assertEqual([call.args[1] for call in processor.process.call_args_list], [1, 2, 3])
             self.assertIsNone(inbox.claim())
             inbox.close()
+
+    def test_finished_messages_are_discarded_and_checkpoint_size_stays_small(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'cursor.json'
+            inbox = MessageQueue(path, -100123)
+            for number in range(1, 1001):
+                inbox.capture(-100123, number, ['https://fkrt.co/private-product'])
+                inbox.claim()
+                inbox.finish(number, [{'status': 'sent', 'detail': 'private report'}])
+            self.assertEqual(inbox.remaining(), 0)
+            self.assertEqual(len(inbox.pending), 0)
+            self.assertIsNone(inbox.active)
+            self.assertLess(path.stat().st_size, 100)
+            self.assertEqual(json.loads(path.read_text()),
+                             {'version': 1, 'chat_id': -100123, 'last_message_id': 1000})
+            self.assertEqual([item.name for item in Path(directory).iterdir()], ['cursor.json'])
+
+    def test_dry_run_does_not_write_or_advance_the_real_cursor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'cursor.json'
+            normal = MessageQueue(path, -100123, 10)
+            normal.close()
+            original = path.read_bytes()
+            dry = MessageQueue(path, -100123, persist=False)
+            dry.capture(-100123, 11, ['https://fkrt.co/test'])
+            dry.claim()
+            dry.finish(11, [])
+            dry.close()
+            self.assertEqual(path.read_bytes(), original)
+            fresh = Path(directory) / 'dry.json'
+            MessageQueue(fresh, -100123, persist=False).close()
+            self.assertFalse(fresh.exists())
+
+    def test_failed_checkpoint_does_not_remove_the_pending_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inbox = MessageQueue(Path(directory) / 'cursor.json', -100123)
+            inbox.capture(-100123, 1, ['https://fkrt.co/test'])
+            with patch.object(inbox, '_save_cursor', side_effect=OSError('disk unavailable')):
+                with self.assertRaises(OSError):
+                    inbox.claim()
+            self.assertEqual(inbox.remaining(), 1)
+            self.assertIsNone(inbox.active)
+            self.assertEqual(inbox.claim()['message_id'], 1)
+
+    def test_legacy_inbox_migration_recovers_only_unclaimed_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = Path(directory) / 'old.sqlite3'
+            db = sqlite3.connect(legacy)
+            db.executescript("""CREATE TABLE scope (group_id INTEGER, cursor INTEGER);
+                               INSERT INTO scope VALUES (-100123, 5);
+                               CREATE TABLE messages (message_id INTEGER, status TEXT);
+                               INSERT INTO messages VALUES (1, 'done'), (2, 'done'),
+                                                           (3, 'processing'), (4, 'pending'), (5, 'pending');""")
+            db.close()
+            original = legacy.read_bytes()
+            path = Path(directory) / 'cursor.json'
+            inbox = MessageQueue(path, -100123, legacy_path=legacy)
+            self.assertEqual(inbox.cursor(), 3)
+            self.assertFalse(inbox.capture(-100123, 3, ['https://fkrt.co/already-claimed']))
+            inbox.capture(-100123, 4, ['https://fkrt.co/pending'])
+            inbox.claim()
+            inbox.finish(4, [])
+            inbox.close()
+            reopened = MessageQueue(path, -100123, legacy_path=legacy)
+            self.assertEqual(reopened.cursor(), 4)
+            self.assertEqual(legacy.read_bytes(), original)
+            with self.assertRaises(ValueError):
+                MessageQueue(Path(directory) / 'wrong.json', -100999, legacy_path=legacy)
+
+    def test_capture_applies_backpressure_and_never_loses_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inbox = MessageQueue(Path(directory) / 'cursor.json', -100123, max_pending=2)
+            observed = []
+            processor = Mock()
+            processor.process.side_effect = lambda group, message, links: observed.append(message)
+
+            class Client:
+                def iter_messages(self, entity, **kwargs):
+                    async def messages():
+                        for number in range(1, 11):
+                            yield SimpleNamespace(chat_id=-100123, id=number,
+                                                  message='https://fkrt.co/test', entities=[], reply_markup=None)
+                    return messages()
+
+            async def drain():
+                wake = asyncio.Event()
+                worker = asyncio.create_task(process_inbox(inbox, processor, wake))
+                try:
+                    count = await asyncio.wait_for(
+                        capture_new_messages(Client(), object(), -100123, inbox, wake, worker), 5)
+                    self.assertEqual(count, 10)
+                    while inbox.remaining():
+                        await asyncio.sleep(.01)
+                finally:
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+            asyncio.run(drain())
+            self.assertEqual(observed, list(range(1, 11)))
+            self.assertEqual(inbox.remaining(), 0)
 
     def test_monitor_lock_is_shared_across_processes_and_released(self):
         with tempfile.TemporaryDirectory() as directory:

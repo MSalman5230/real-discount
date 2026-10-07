@@ -3,7 +3,7 @@ FROM python:3.11-slim-bookworm AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     REAL_DISCOUNT_DATA_DIR=/data \
-    MPLCONFIGDIR=/data/.mpl-cache \
+    MPLCONFIGDIR=/tmp/matplotlib \
     MPLBACKEND=Agg
 
 WORKDIR /app

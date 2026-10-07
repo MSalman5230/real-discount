@@ -2,7 +2,6 @@
 
 import argparse
 import asyncio
-import hashlib
 import getpass
 import json
 import os
@@ -16,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from deal_report import prepare_report, save_report
+from deal_report import prepare_report, render_graph, report_caption
 from price_history import PriceHistoryError
 from message_queue import MessageQueue
 from settings import read_settings
@@ -24,7 +23,6 @@ from monitor_lock import MonitorLock
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("REAL_DISCOUNT_DATA_DIR") or ROOT)
-STATE_PATH = DATA_DIR / "results" / "telegram-state.json"
 GROUP_BINDING_PATH = DATA_DIR / ".telegram-group-binding.json"
 READ_STATE_PATH = DATA_DIR / "results" / "telegram-read-state.json"
 INBOX_PATH = DATA_DIR / "results" / "telegram-inbox.sqlite3"
@@ -100,9 +98,9 @@ class TelegramBot:
         return info
 
     def send_report(self, recipient, graph, caption):
-        with Path(graph).open("rb") as photo:
-            sent = self.call("sendPhoto", {"chat_id": recipient, "caption": caption[:1024]},
-                             {"photo": (Path(graph).name, photo, "image/png")})
+        graph.seek(0)
+        sent = self.call("sendPhoto", {"chat_id": recipient, "caption": caption[:1024]},
+                         {"photo": ("deal-6months.png", graph, "image/png")})
         if len(caption) > 1024:
             time.sleep(1)
             self.call("sendMessage", {"chat_id": recipient, "text": caption[:4096],
@@ -140,7 +138,6 @@ class DeliveryProcessor:
         if not self.recipient and not dry_run:
             raise ValueError("Set TELEGRAM_CHAT_ID in .env after pressing Start on your bot.")
         self.bot = None if dry_run else TelegramBot()
-        self.state = json.loads(STATE_PATH.read_text(encoding="utf-8")) if STATE_PATH.exists() else {"sent": []}
 
     def process(self, chat_id, message_id, links):
         outcomes = []
@@ -149,26 +146,18 @@ class DeliveryProcessor:
         except ValueError as exc:
             print(f"Settings error: {exc}", file=sys.stderr, flush=True)
             return [{"status": "settings_error", "error": str(exc)}]
-        for link in links:
-            key = hashlib.sha256(f"{chat_id}:{message_id}:{link}".encode()).hexdigest()
-            if key in self.state["sent"] and self.bot:
-                outcomes.append({"status": "already_sent"})
-                continue
+        for link in dict.fromkeys(links):
             try:
                 result = prepare_report(link, settings.months, settings.threshold)
                 if result["six_month_analysis"]["median_rule_verdict"] != "BUY":
                     print(f"Skipped {result.get('product_id', 'product')}: {result['six_month_analysis']['drop_percent']:.2f}% is not above {settings.threshold:g}%.", flush=True)
                     outcomes.append({"status": "below_threshold", "drop_percent": result["six_month_analysis"]["drop_percent"]})
                     continue
-                _, graph, caption = save_report(result, DATA_DIR / "results" / "alerts" / key)
-                if self.bot:
-                    self.bot.send_report(self.recipient, graph, caption)
-                    self.state["sent"] = (self.state["sent"] + [key])[-2000:]
-                    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = STATE_PATH.with_suffix(".tmp")
-                    temporary.write_text(json.dumps(self.state), encoding="utf-8")
-                    temporary.replace(STATE_PATH)
-                print(f"{'Sent' if self.bot else 'Prepared'} report for {graph.stem}", flush=True)
+                caption = report_caption(result)
+                with render_graph(result) as graph:
+                    if self.bot:
+                        self.bot.send_report(self.recipient, graph, caption)
+                print(f"{'Sent' if self.bot else 'Prepared'} report for {result.get('product_id', 'product')}", flush=True)
                 outcomes.append({"status": "sent" if self.bot else "dry_run", "product_id": result.get("product_id")})
             except (requests.RequestException, PriceHistoryError, ValueError, OSError) as exc:
                 print(f"Product processing failed: {redact(exc)}", file=sys.stderr, flush=True)
@@ -182,12 +171,17 @@ def message_links(message):
     return extract_links(message.message, message.entities, buttons)
 
 
-async def capture_new_messages(client, entity, chat_id, inbox, wake):
+async def capture_new_messages(client, entity, chat_id, inbox, wake, worker=None):
     count = 0
     # limit=None lets Telethon paginate every new message, not just one or 100.
     async for message in client.iter_messages(entity, min_id=inbox.cursor(), reverse=True, limit=None):
         if message.chat_id != chat_id:
             raise ValueError("Refusing to inspect a message outside the approved group.")
+        while inbox.full():
+            if worker is not None and worker.done():
+                worker.result()
+            wake.set()
+            await asyncio.sleep(.05)
         if inbox.capture(chat_id, message.id, message_links(message)):
             count += 1
             wake.set()
@@ -202,11 +196,13 @@ async def process_inbox(inbox, processor, wake):
             await wake.wait()
             continue
         try:
-            outcomes = await asyncio.to_thread(processor.process, job["group_id"], job["message_id"], job["links"])
+            outcomes = (await asyncio.to_thread(processor.process, job["group_id"], job["message_id"], job["links"])
+                        if job["links"] else [])
         except Exception as exc:
             outcomes = [{"status": "failed", "error": redact(exc)[:1000]}]
             print(f"Message processing error: {redact(exc)}", file=sys.stderr, flush=True)
         inbox.finish(job["message_id"], outcomes)
+        del job, outcomes
 
 
 async def read_group(args):
@@ -230,6 +226,8 @@ async def read_group(args):
     # No account-wide update subscription; only targeted GetHistory requests.
     client = TelegramClient(str(session_path), int(api_id), api_hash,
                             receive_updates=False, catch_up=False)
+    # Authentication persists, but encountered users/chats need no disk cache.
+    client.session.save_entities = False
     try:
         # Authentication is local; the code and 2FA password are never echoed.
         await client.start(phone=phone,
@@ -243,7 +241,8 @@ async def read_group(args):
         chat_id = utils.get_peer_id(entity)
         previous_binding = json.loads(GROUP_BINDING_PATH.read_text(encoding="utf-8")) if GROUP_BINDING_PATH.exists() else None
         binding = verify_group(entity.title, chat_id, previous_binding)
-        GROUP_BINDING_PATH.write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
+        if binding != previous_binding:
+            GROUP_BINDING_PATH.write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Verified approved group: {entity.title} (ID {chat_id}).", flush=True)
         processor = DeliveryProcessor(args.dry_run)
         state = json.loads(READ_STATE_PATH.read_text(encoding="utf-8")) if READ_STATE_PATH.exists() else {}
@@ -253,19 +252,23 @@ async def read_group(args):
         if last_id is None:
             newest = await client.get_messages(entity, limit=1)
             last_id = newest[0].id if newest else 0
-        inbox_path = INBOX_PATH if not args.dry_run else DATA_DIR / "results" / "telegram-inbox-dryrun.sqlite3"
-        inbox = MessageQueue(inbox_path, chat_id, last_id)
+        inbox = MessageQueue(READ_STATE_PATH, chat_id, last_id,
+                             legacy_path=INBOX_PATH, persist=not args.dry_run)
         wake = asyncio.Event()
         worker = asyncio.create_task(process_inbox(inbox, processor, wake))
-        print(f"Group-only polling: {entity.title}. Persistent inbox; each message claimed once. Alerts only above the .env threshold.", flush=True)
+        print(f"Group-only polling: {entity.title}. Bounded RAM inbox; only a small restart cursor is saved. Alerts only above the .env threshold.", flush=True)
         try:
             while True:
+                if worker.done():
+                    worker.result()
                 try:
-                    count = await capture_new_messages(client, entity, chat_id, inbox, wake)
+                    count = await capture_new_messages(client, entity, chat_id, inbox, wake, worker)
                     if count:
                         print(f"Queued {count} new message(s). Cursor: {inbox.cursor()}.", flush=True)
                     if args.once:
                         while inbox.remaining():
+                            if worker.done():
+                                worker.result()
                             await asyncio.sleep(.2)
                         return
                     interval = args.poll_seconds if args.poll_seconds is not None else read_settings().poll_seconds

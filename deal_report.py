@@ -7,6 +7,7 @@ import os
 import textwrap
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 
 from price_history import PriceHistoryError, fetch_all_history
@@ -114,7 +115,8 @@ def report_caption(result):
     return "\n".join(lines)
 
 
-def render_graph(result, output):
+def render_graph(result, output=None):
+    """Render a PNG to a memory buffer, or explicitly export it to a path."""
     os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).parent / ".mpl-cache"))
     import matplotlib
     matplotlib.use("Agg")
@@ -181,11 +183,22 @@ def render_graph(result, output):
                  fontsize=10, color="#526075")
     fig.text(.09, .035, "Source: PriceHistory.app  ·  Prices carried forward until the next observation  ·  Currency: INR",
              fontsize=9, color="#526075")
-    output = Path(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return output
+    if output is None:
+        output = BytesIO()
+    else:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fig.savefig(output, format="png", facecolor=fig.get_facecolor())
+        if hasattr(output, "seek"):
+            output.seek(0)
+        return output
+    except Exception:
+        if isinstance(output, BytesIO):
+            output.close()
+        raise
+    finally:
+        plt.close(fig)
 
 
 def prepare_report(url, months=6, threshold=20, as_of=None):
@@ -216,18 +229,22 @@ def main():
     parser.add_argument("--months", type=int, default=None)
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--as-of", help="Optional reproducible end date/time in IST")
-    parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent / "results")
+    parser.add_argument("--output-dir", type=Path,
+                        help="Explicitly save a graph, JSON and caption; otherwise keep processing in memory")
     parser.add_argument("--send", action="store_true", help="Send report to TELEGRAM_CHAT_ID")
     args = parser.parse_args()
     try:
         from settings import read_settings
         settings = read_settings()
-        result, graph, caption = create_report(args.url, args.output_dir,
-                                               args.months if args.months is not None else settings.months,
-                                               args.threshold if args.threshold is not None else settings.threshold,
-                                               args.as_of)
+        result = prepare_report(args.url,
+                                args.months if args.months is not None else settings.months,
+                                args.threshold if args.threshold is not None else settings.threshold,
+                                args.as_of)
+        caption = report_caption(result)
+        if args.output_dir is not None:
+            _, graph, _ = save_report(result, args.output_dir)
+            print(f"Graph: {graph.resolve()}")
         print(caption.encode("ascii", "backslashreplace").decode())
-        print(f"Graph: {graph.resolve()}")
         if args.send:
             from telegram_monitor import TelegramBot, load_config
             load_config()
@@ -238,7 +255,8 @@ def main():
             if result["six_month_analysis"]["median_rule_verdict"] != "BUY":
                 print("No Telegram alert: drop does not exceed the configured threshold.")
                 return
-            TelegramBot().send_report(recipient, graph, caption)
+            with render_graph(result) as graph:
+                TelegramBot().send_report(recipient, graph, caption)
             print("Report sent to Telegram.")
     except (ValueError, PriceHistoryError) as exc:
         parser.exit(1, f"Error: {exc}\n")

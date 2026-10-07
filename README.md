@@ -5,6 +5,8 @@ Uses PriceHistory.app's six-month time-weighted median to identify discounts.
 Sends you a Telegram graph, percentage drop and available buying assessment
 only when the price is **more than 20% below the median** (configurable).
 Messages are processed once, including across restarts.
+Product histories, graphs and captions are processed in memory and released
+after sending; the monitor does not save report files or processed messages.
 
 ## Run
 
@@ -77,12 +79,40 @@ The Dockerfile and `compose.yaml` are in the repository root; the workflow
 is `.github/workflows/docker.yml`. Credentials, Telegram sessions and local
 results are excluded from the Docker build context.
 
+### Memory and disk use
+
+The inbox holds at most 256 messages in RAM and pauses fetching while full.
+Each graph is rendered directly into a memory buffer, uploaded to Telegram,
+then closed. Finished messages and processing details are discarded.
+
+Only the Telegram login session, approved group binding, a lock file and a
+small JSON reading checkpoint persist. The checkpoint contains the group ID
+and last claimed message ID, never product data or links, and stays under
+100 bytes for normal Telegram message IDs. It is saved before processing
+each message to prevent replay after a restart. As before, a crash during
+processing can interrupt that message's delivery; unclaimed messages are
+fetched again from Telegram. Dry runs do not advance the real checkpoint.
+Telegram's encountered-user/chat cache is disabled.
+
+Docker Compose mounts `/tmp` in RAM for Matplotlib's font cache and temporary
+files, and disables stored container logs. For a direct Python run outside
+Docker, Matplotlib keeps a small font cache in `.mpl-cache`; you can set
+`MPLCONFIGDIR` to a RAM-backed directory on your system instead.
+A host may swap tmpfs pages to disk; strict avoidance of physical disk
+writes also depends on the host's swap configuration.
+See [Docker's tmpfs documentation](https://docs.docker.com/engine/storage/tmpfs/).
+
+The standalone `deal_report.py` command also keeps processing in memory by
+default. Files are created only when explicitly requested with
+`--output-dir DIRECTORY`.
+
 ### Directory mappings
 
 | Host path (beside compose.yaml) | Container path | Purpose |
 | --- | --- | --- |
 | `./.env` | `/app/.env` (read only) | Telegram credentials and settings; numeric settings reload while running. |
-| `./data` | `/data` (read/write) | Telegram session, group binding, monitor lock, inbox, reading/delivery state, graphs and Matplotlib cache. |
+| `./data` | `/data` (read/write) | Telegram session, group binding, lock and small reading checkpoint. |
+| RAM mount (64 MiB limit) | `/tmp` | Temporary files and Matplotlib font cache; discarded when the container stops. |
 
 To store data in another directory, change the `source: ./data` value in
 `compose.yaml` to that directory's absolute path. Keep its target as `/data`.
@@ -131,8 +161,11 @@ Start the monitor in the background after the login succeeds:
 
 ```sh
 docker compose up -d
-docker compose logs -f
 ```
+
+For console output, stop the background monitor and run
+`docker compose run --rm real-discount watch` in the foreground.
+Container logs are not archived on disk.
 
 Stop it with `docker compose down`. The host `data` directory survives
 container replacement. To update later, run `docker compose pull` followed
@@ -141,13 +174,22 @@ by `docker compose up -d`.
 ### Move an existing local session to Docker
 
 Stop the local monitor before copying its files. Copy `telegram-user.session`
-(or the session named in your `.env`), `.telegram-group-binding.json`, and the
-entire `results` directory into `data`, preserving their names. For example,
-`results/telegram-inbox.sqlite3` becomes `data/results/telegram-inbox.sqlite3`.
-Include any SQLite journal/WAL files and session sidecar files if present.
+(or the session named in your `.env`) and `.telegram-group-binding.json`
+into `data`. Copy `results/telegram-read-state.json` and the previous
+`results/telegram-inbox.sqlite3` if present into `data/results`.
+Include the inbox's SQLite journal/WAL files and session sidecar files
+if present. Saved graphs, reports, captions and `telegram-state.json`
+do not need to be copied.
 Keep `.env` beside `compose.yaml`, then apply the Linux ownership command
 above if needed. This preserves the login and processed-message state.
 Do not run the local and Docker monitors simultaneously.
+
+On the first upgraded run, the previous SQLite inbox is read to recover the
+message cursor and any unclaimed messages; it is then left unused. Once that
+run has created a checkpoint with `"version":1`, old inbox databases, their
+sidecar files, `telegram-state.json`, saved report directories and old graph
+caches can be removed while the monitor is stopped. Keep
+`results/telegram-read-state.json`, the session and group binding files.
 
 Without Docker, paths continue to use the repository directory by default.
 To choose another data directory, set `REAL_DISCOUNT_DATA_DIR` in the process
