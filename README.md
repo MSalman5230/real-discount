@@ -40,7 +40,8 @@ Get the Telegram values:
 ```
 
 Leave `TELEGRAM_SOURCE_CHATS` as shown; your account must already belong to
-that group. These optional settings use the defaults below and reload automatically:
+that group. These optional settings use the defaults below and reload automatically
+for direct Python runs:
 
 ```dotenv
 HISTORY_MONTHS=6
@@ -106,17 +107,41 @@ The standalone `deal_report.py` command also keeps processing in memory by
 default. Files are created only when explicitly requested with
 `--output-dir DIRECTORY`.
 
-### Directory mappings
+### Configuration and directory mappings
+
+Keep `.env` beside `compose.yaml`. Compose reads it using `env_file` and
+passes its values into the container's environment. The app reads those
+values without requiring an `.env` volume mount. This also works when
+you launch Compose from another directory with `docker compose -f PATH/compose.yaml`.
+See [Docker's env_file documentation](https://docs.docker.com/reference/compose-file/services/#env_file).
+
+The service uses:
+
+```yaml
+env_file:
+  - ./.env
+volumes:
+  - ./data:/data
+```
+
+After changing the Docker `.env`, recreate the container so it receives
+the new values. A plain `docker compose restart` keeps its old environment:
+
+```sh
+docker compose up -d --force-recreate real-discount
+```
+
+Direct Python runs continue to reload numeric settings from their local
+`.env` while running. When a local file exists, its settings take precedence
+over process environment values.
 
 | Host path (beside compose.yaml) | Container path | Purpose |
 | --- | --- | --- |
-| `./.env` | `/app/.env` (read only) | Telegram credentials and settings; numeric settings reload while running. |
 | `./data` | `/data` (read/write) | Telegram session, group binding, lock and small reading checkpoint. |
-| RAM mount (64 MiB limit) | `/tmp` | Temporary files and Matplotlib font cache; discarded when the container stops. |
+| RAM mount (256 MiB limit) | `/tmp` | Temporary files and Matplotlib font cache; discarded when the container stops. |
 
-Compose uses short mount syntax: `host-path:container-path`, with `:ro`
-for the read-only configuration file. The `/data` mount holds only the saved
-login and restart metadata; product processing stays in memory.
+The state mount uses short syntax: `host-path:container-path`.
+It holds only the saved login and restart metadata; product processing stays in memory.
 
 To store that state in another directory, replace the host side of
 `./data:/data` with its absolute path, for example

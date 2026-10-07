@@ -1,6 +1,7 @@
-"""Reload editable analysis and polling settings from .env."""
+"""Read environment settings, with an editable local .env taking precedence."""
 
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,13 +18,15 @@ class Settings:
 
 
 def read_settings(path=None):
-    values = dotenv_values(path or ROOT / ".env")
+    # Compose supplies env_file values in the process environment. Direct
+    # Python runs retain live reloading from their editable local .env.
+    values = {**os.environ, **dotenv_values(path or ROOT / ".env")}
     try:
         settings = Settings(int(values.get("HISTORY_MONTHS") or 6),
                             float(values.get("DISCOUNT_THRESHOLD_PERCENT") or 20),
                             float(values.get("TELEGRAM_POLL_SECONDS") or 3))
     except (TypeError, ValueError):
-        raise ValueError("Invalid numeric setting in .env.") from None
+        raise ValueError("Invalid numeric setting in .env or environment variables.") from None
     if settings.months <= 0 or not math.isfinite(settings.threshold) or not 0 <= settings.threshold <= 100:
         raise ValueError("HISTORY_MONTHS must be positive; DISCOUNT_THRESHOLD_PERCENT must be 0–100.")
     if not math.isfinite(settings.poll_seconds) or settings.poll_seconds < 1:
