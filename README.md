@@ -100,19 +100,41 @@ container user unset so startup can initialize data permissions before
 running the monitor as UID/GID 10001. For older image versions, follow
 [the permission repair instructions](#fix-permission-errors-on-an-existing-deployment).
 
-Pull the image and complete the first Telegram login interactively:
+Pull and deploy the image:
 
 ```sh
 docker compose pull real-discount
-docker compose run --rm real-discount watch --once
-```
-
-Enter the login code and 2FA password if prompted. After login succeeds,
-start the background monitor:
-
-```sh
 docker compose up -d real-discount
 ```
+
+If the saved Telegram session is not logged in, the container stays running
+and prints login instructions in its logs. Monitoring remains paused, and no
+login code is requested until you run the interactive login command.
+
+In Dockhand, open **Containers**, select the Real Discount container, choose
+**Terminal**, and select shell **sh** and user **root**. Run:
+
+```sh
+python /app/docker_entrypoint.py login
+```
+
+The entrypoint runs the login command as the app user. Enter the Telegram
+code and 2FA password at the hidden prompts. Once it prints `Login successful`,
+restart the container in Dockhand. The saved session is reused after restarts
+and updates as long as the data directory is preserved and Telegram has not
+revoked the session. No temporary Compose command or entrypoint override is
+needed for this flow. See [Dockhand's Terminal documentation](https://dockhand.pro/manual/#terminal).
+
+From a host terminal, the equivalent commands are:
+
+```sh
+docker compose exec real-discount python /app/docker_entrypoint.py login
+docker compose restart real-discount
+```
+
+Run the restart only after the login command finishes successfully. A login
+code and any 2FA password are entered interactively; they do not need to be
+added to the container's environment.
 
 When updating the image or changing environment values, pull and recreate the service:
 
@@ -121,10 +143,10 @@ docker compose pull real-discount
 docker compose up -d --force-recreate real-discount
 ```
 
-The example disables stored container logs and puts temporary files in RAM.
-For console output, stop the background monitor and run it in the foreground
-using the commands in the example file. See First run below for private
-registry login and additional setup details.
+The example keeps one container console log file with a 1 MiB rotation
+limit, so Dockhand's Logs view can display startup and login instructions.
+Temporary files stay in RAM. See First run below for private registry login
+and additional setup details.
 
 ### Memory and disk use
 
@@ -132,8 +154,9 @@ The inbox holds at most 256 messages in RAM and pauses fetching while full.
 Each graph is rendered directly into a memory buffer, uploaded to Telegram,
 then closed. Finished messages and processing details are discarded.
 
-Only the Telegram login session, approved group binding, a lock file and a
-small JSON reading checkpoint persist. The checkpoint contains the group ID
+The application persists only the Telegram login session, approved group
+binding, a lock file and a small JSON reading checkpoint. Docker manages the
+bounded console logs separately. The checkpoint contains the group ID
 and last claimed message ID, never product data or links, and stays under
 100 bytes for normal Telegram message IDs. It is saved before processing
 each message to prevent replay after a restart. As before, a crash during
@@ -144,8 +167,12 @@ Dry runs do not advance the real checkpoint.
 Telegram's encountered-user/chat cache is disabled.
 
 Docker Compose mounts `/tmp` in RAM for Matplotlib's font cache and temporary
-files, and disables stored container logs. For a direct Python run outside
-Docker, Matplotlib keeps a small font cache in `.mpl-cache`; you can set
+files. Its `local` logging driver keeps one console log file with a 1 MiB
+rotation limit, allowing Docker managers to display setup instructions.
+To disable retained console logs, change the logging block to
+`logging: {driver: none}`; container log viewers will then have no output.
+For a direct Python run outside Docker, Matplotlib keeps a small font cache
+in `.mpl-cache`; you can set
 `MPLCONFIGDIR` to a RAM-backed directory on your system instead.
 A host may swap tmpfs pages to disk; strict avoidance of physical disk
 writes also depends on the host's swap configuration.
@@ -238,13 +265,19 @@ If the GitHub package is private, first run `docker login ghcr.io -u YOUR_GITHUB
 and use a GitHub personal access token with `read:packages` as the password.
 Alternatively, build locally with `docker compose build`.
 
-For a new Telegram session, run this interactively and enter the Telegram
-login code and 2FA password when prompted. It saves the session, verifies
-the approved group and processes any new queued messages once, then exits:
+For a new Telegram session, you can authenticate before deploying by
+running this interactively. Enter the Telegram login code and 2FA password
+when prompted. It saves the session and verifies the approved group, then
+exits without reading or processing any group messages:
 
 ```sh
-docker compose run --rm real-discount watch --once
+docker compose run --rm real-discount login
 ```
+
+Alternatively, deploy first and follow the Dockhand Terminal or
+`docker compose exec` login flow in Host the published image above. A detached
+monitor with an unauthenticated session stays running until you log in and
+restart it.
 
 Start the monitor in the background after the login succeeds:
 
@@ -252,9 +285,14 @@ Start the monitor in the background after the login succeeds:
 docker compose up -d
 ```
 
-For console output, stop the background monitor and run
-`docker compose run --rm real-discount watch` in the foreground.
-Container logs are not archived on disk.
+View console output in Dockhand's Logs view or with:
+
+```sh
+docker compose logs --tail 50 real-discount
+```
+
+To run in the foreground, stop the background monitor and run
+`docker compose run --rm real-discount watch`.
 
 Stop it with `docker compose down`. The host `data` directory survives
 container replacement. To update later, run `docker compose pull` followed

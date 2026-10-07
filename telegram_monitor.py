@@ -32,6 +32,28 @@ AUTHORIZED_GROUP_NAME = "DealAlerts🔔 Loot Deals"
 RESTART_LOOKBACK = timedelta(minutes=30)
 
 
+class LoginRequired(ValueError):
+    """The saved user session needs interactive authentication."""
+
+
+def login_command():
+    if ROOT == Path("/app"):
+        return "python /app/docker_entrypoint.py login"
+    return f'python "{ROOT / "telegram_monitor.py"}" login'
+
+
+def wait_for_login():
+    print("Telegram account is not logged in. Monitoring is paused.", flush=True)
+    print("Open this container's Terminal in Dockhand (shell sh, user root) and run:\n"
+          f"  {login_command()}\n"
+          "Enter the Telegram login code and 2FA password when prompted.\n"
+          "After login succeeds, restart the container to begin monitoring.", flush=True)
+    # The client has disconnected and the lock has been released before this
+    # wait. A docker exec login can safely use the same persistent session.
+    while True:
+        time.sleep(60)
+
+
 def authorized_source(value):
     sources = [item.strip() for item in (value or "").split(",") if item.strip()]
     if sources != [AUTHORIZED_SOURCE]:
@@ -241,7 +263,7 @@ async def read_group(args):
     phone = os.environ.get("TELEGRAM_PHONE")
     source = authorized_source(os.environ.get("TELEGRAM_SOURCE_CHATS"))
     if not api_id or not api_hash or not phone:
-        raise ValueError("Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE and TELEGRAM_SOURCE_CHATS in .env.")
+        raise ValueError("Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE and TELEGRAM_SOURCE_CHATS in the environment or .env.")
     session_name = os.environ.get("TELEGRAM_USER_SESSION") or "telegram-user"
     session_path = Path(session_name)
     if not session_path.is_absolute():
@@ -252,6 +274,12 @@ async def read_group(args):
     # Authentication persists, but encountered users/chats need no disk cache.
     client.session.save_entities = False
     try:
+        await client.connect()
+        if not await client.is_user_authorized() and not sys.stdin.isatty():
+            # Detached startup must not request an expiring code or read stdin.
+            # Disconnect before waiting so an exec login owns the session file.
+            raise LoginRequired(f"Telegram login requires an interactive terminal. Run {login_command()} "
+                                "and enter the code when prompted, then restart the container.")
         # Authentication is local; the code and 2FA password are never echoed.
         await client.start(phone=phone,
                            code_callback=lambda: getpass.getpass("Telegram login code (hidden): "),
@@ -267,6 +295,9 @@ async def read_group(args):
         if binding != previous_binding:
             GROUP_BINDING_PATH.write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Verified approved group: {entity.title} (ID {chat_id}).", flush=True)
+        if args.command == "login":
+            print("Login successful. Session saved. Restart the container to begin monitoring.", flush=True)
+            return
         processor = DeliveryProcessor(args.dry_run)
         inbox = await open_inbox(client, entity, chat_id, persist=not args.dry_run)
         wake = asyncio.Event()
@@ -311,6 +342,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("discover", help="Check bot identity and available delivery chat IDs")
+    subparsers.add_parser("login", help="Log in interactively and save the approved group session, then exit")
     watch = subparsers.add_parser("watch", help="Read only configured groups through your Telegram user session")
     watch.add_argument("--once", action="store_true", help="Drain new messages with restart catch-up limited to 30 minutes, then exit")
     watch.add_argument("--dry-run", action="store_true", help="Generate reports without sending them")
@@ -321,10 +353,15 @@ def main():
         if args.command == "discover":
             print(json.dumps(TelegramBot().discover(), ensure_ascii=True, indent=2))
         else:
-            if args.poll_seconds is not None and args.poll_seconds < 1:
+            if args.command == "watch" and args.poll_seconds is not None and args.poll_seconds < 1:
                 raise ValueError("Polling interval must be at least 1 second.")
-            with MonitorLock(DATA_DIR / ".telegram-monitor.lock"):
-                asyncio.run(read_group(args))
+            try:
+                with MonitorLock(DATA_DIR / ".telegram-monitor.lock"):
+                    asyncio.run(read_group(args))
+            except LoginRequired:
+                if args.command != "watch" or args.once:
+                    raise
+                wait_for_login()
     except KeyboardInterrupt:
         print("Stopped.")
     except Exception as exc:

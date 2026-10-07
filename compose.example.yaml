@@ -1,7 +1,9 @@
 # Standalone deployment: save this file as compose.yaml in your hosting folder.
 # Set the required variables in your shell or Docker hosting platform.
-# First login: docker compose run --rm real-discount watch --once
-# Start after login: docker compose up -d
+# Deploy: docker compose up -d
+# If not logged in, the container stays running and logs setup instructions.
+# Dockhand Terminal (sh, user root): python /app/docker_entrypoint.py login
+# Enter the code/2FA password at the prompts, then restart the container.
 
 services:
   real-discount:
@@ -35,8 +37,9 @@ services:
     # Keep Matplotlib's cache and temporary files in RAM.
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=256m,mode=1777
-    # To view output, stop the service and run it in the foreground:
-    # docker compose stop real-discount
-    # docker compose run --rm real-discount watch
+    # Dockhand can display startup/login instructions in these bounded logs.
     logging:
-      driver: none
+      driver: local
+      options:
+        max-size: "1m"
+        max-file: "1"
