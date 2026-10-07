@@ -23,10 +23,11 @@ from settings import read_settings
 from monitor_lock import MonitorLock
 
 ROOT = Path(__file__).resolve().parent
-STATE_PATH = ROOT / "results" / "telegram-state.json"
-GROUP_BINDING_PATH = ROOT / ".telegram-group-binding.json"
-READ_STATE_PATH = ROOT / "results" / "telegram-read-state.json"
-INBOX_PATH = ROOT / "results" / "telegram-inbox.sqlite3"
+DATA_DIR = Path(os.environ.get("REAL_DISCOUNT_DATA_DIR") or ROOT)
+STATE_PATH = DATA_DIR / "results" / "telegram-state.json"
+GROUP_BINDING_PATH = DATA_DIR / ".telegram-group-binding.json"
+READ_STATE_PATH = DATA_DIR / "results" / "telegram-read-state.json"
+INBOX_PATH = DATA_DIR / "results" / "telegram-inbox.sqlite3"
 AUTHORIZED_SOURCE = "https://t.me/+RMtFLhPbWG9Hn0MQ"
 AUTHORIZED_GROUP_NAME = "DealAlerts🔔 Loot Deals"
 
@@ -159,7 +160,7 @@ class DeliveryProcessor:
                     print(f"Skipped {result.get('product_id', 'product')}: {result['six_month_analysis']['drop_percent']:.2f}% is not above {settings.threshold:g}%.", flush=True)
                     outcomes.append({"status": "below_threshold", "drop_percent": result["six_month_analysis"]["drop_percent"]})
                     continue
-                _, graph, caption = save_report(result, ROOT / "results" / "alerts" / key)
+                _, graph, caption = save_report(result, DATA_DIR / "results" / "alerts" / key)
                 if self.bot:
                     self.bot.send_report(self.recipient, graph, caption)
                     self.state["sent"] = (self.state["sent"] + [key])[-2000:]
@@ -225,7 +226,7 @@ async def read_group(args):
     session_name = os.environ.get("TELEGRAM_USER_SESSION") or "telegram-user"
     session_path = Path(session_name)
     if not session_path.is_absolute():
-        session_path = ROOT / session_path
+        session_path = DATA_DIR / session_path
     # No account-wide update subscription; only targeted GetHistory requests.
     client = TelegramClient(str(session_path), int(api_id), api_hash,
                             receive_updates=False, catch_up=False)
@@ -252,7 +253,7 @@ async def read_group(args):
         if last_id is None:
             newest = await client.get_messages(entity, limit=1)
             last_id = newest[0].id if newest else 0
-        inbox_path = INBOX_PATH if not args.dry_run else ROOT / "results" / "telegram-inbox-dryrun.sqlite3"
+        inbox_path = INBOX_PATH if not args.dry_run else DATA_DIR / "results" / "telegram-inbox-dryrun.sqlite3"
         inbox = MessageQueue(inbox_path, chat_id, last_id)
         wake = asyncio.Event()
         worker = asyncio.create_task(process_inbox(inbox, processor, wake))
@@ -304,7 +305,7 @@ def main():
         else:
             if args.poll_seconds is not None and args.poll_seconds < 1:
                 raise ValueError("Polling interval must be at least 1 second.")
-            with MonitorLock(ROOT / ".telegram-monitor.lock"):
+            with MonitorLock(DATA_DIR / ".telegram-monitor.lock"):
                 asyncio.run(read_group(args))
     except KeyboardInterrupt:
         print("Stopped.")

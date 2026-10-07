@@ -1,5 +1,7 @@
 import asyncio
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -189,6 +191,22 @@ class InboxTests(unittest.TestCase):
             self.assertEqual([call.args[1] for call in processor.process.call_args_list], [1, 2, 3])
             self.assertIsNone(inbox.claim())
             inbox.close()
+
+    def test_monitor_lock_is_shared_across_processes_and_released(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "new-data" / "monitor.lock"
+            code = ("from monitor_lock import MonitorLock; "
+                    "lock = MonitorLock(__import__('sys').argv[1]); "
+                    "lock.__enter__(); lock.__exit__()")
+            command = [sys.executable, "-c", code, str(path)]
+            with MonitorLock(path):
+                child = subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
+                                       capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertIn("already running", child.stderr)
+            child = subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
+                                   capture_output=True, text=True, timeout=10)
+            self.assertEqual(child.returncode, 0, child.stderr)
 
     def test_a_second_monitor_cannot_open_the_same_inbox(self):
         with tempfile.TemporaryDirectory() as directory:

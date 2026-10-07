@@ -1,5 +1,6 @@
 """Prevent two monitor instances from processing the same inbox."""
 
+import os
 from pathlib import Path
 
 
@@ -9,7 +10,7 @@ class MonitorLock:
         self.file = None
 
     def __enter__(self):
-        import msvcrt
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.file = self.path.open("a+b")
         self.file.seek(0, 2)
         if self.file.tell() == 0:
@@ -17,14 +18,25 @@ class MonitorLock:
             self.file.flush()
         self.file.seek(0)
         try:
-            msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self.file.close()
             raise ValueError("The Telegram monitor is already running.") from None
         return self
 
     def __exit__(self, *args):
-        import msvcrt
-        self.file.seek(0)
-        msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
-        self.file.close()
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.file.seek(0)
+                msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.file.close()

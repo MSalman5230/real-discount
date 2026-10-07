@@ -1,0 +1,20 @@
+services:
+  real-discount:
+    image: ghcr.io/msalman5230/real-discount:latest
+    build:
+      context: .
+      target: runtime
+    init: true
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false

@@ -12,3 +12,4 @@ results/telegram-monitor.pid
 .telegram-monitor.lock
 results/telegram-inbox*.sqlite3*
 results/
+data/

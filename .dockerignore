@@ -1,0 +1,16 @@
+# Only application code and test/build inputs belong in the build context.
+*
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!requirements-telegram.txt
+!deal_report.py
+!message_queue.py
+!monitor_lock.py
+!price_history.py
+!settings.py
+!telegram_monitor.py
+!pipelines/
+!pipelines/*.py
+!tests/
+!tests/test_*.py

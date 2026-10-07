@@ -55,3 +55,108 @@ Start the reader:
 Enter the login code and, if enabled, your Telegram 2FA password when prompted
 on the first run. Keep the process running; stop with **Ctrl+C** and restart it
 after a reboot.
+
+## Docker
+
+GitHub Actions builds and tests a Linux/amd64 image on every push to
+`master`, then publishes it to GitHub Container Registry:
+
+```text
+ghcr.io/msalman5230/real-discount:latest
+ghcr.io/msalman5230/real-discount:master
+ghcr.io/msalman5230/real-discount:sha-<commit>
+```
+
+Pull requests targeting `master` build and test without publishing.
+Publishing uses the
+repository's automatic `GITHUB_TOKEN` with `packages: write`; no Docker Hub
+account or additional repository secret is needed.
+See [GitHub's container publishing documentation](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images).
+
+The Dockerfile and `compose.yaml` are in the repository root; the workflow
+is `.github/workflows/docker.yml`. Credentials, Telegram sessions and local
+results are excluded from the Docker build context.
+
+### Directory mappings
+
+| Host path (beside compose.yaml) | Container path | Purpose |
+| --- | --- | --- |
+| `./.env` | `/app/.env` (read only) | Telegram credentials and settings; numeric settings reload while running. |
+| `./data` | `/data` (read/write) | Telegram session, group binding, monitor lock, inbox, reading/delivery state, graphs and Matplotlib cache. |
+
+To store data in another directory, change the `source: ./data` value in
+`compose.yaml` to that directory's absolute path. Keep its target as `/data`.
+Use a local filesystem that supports SQLite and file locks, and keep one
+monitor running per session/data directory. No port mapping is needed.
+
+### First run
+
+Install Docker with Linux containers and Docker Compose. Create `.env`
+from `.env.example`, then fill the Telegram values described above.
+Keep `TELEGRAM_USER_SESSION=telegram-user`; relative session paths resolve
+inside `/data` in Docker.
+
+Create the host data directory. On Windows, use PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force data
+```
+
+On Linux, allow the container's user (UID/GID 10001) to write to it:
+
+```sh
+mkdir -p data
+sudo chown -R 10001:10001 data
+```
+
+Pull the published image:
+
+```sh
+docker compose pull
+```
+
+If the GitHub package is private, first run `docker login ghcr.io -u YOUR_GITHUB_USERNAME`
+and use a GitHub personal access token with `read:packages` as the password.
+Alternatively, build locally with `docker compose build`.
+
+For a new Telegram session, run this interactively and enter the Telegram
+login code and 2FA password when prompted. It saves the session, verifies
+the approved group and processes any new queued messages once, then exits:
+
+```sh
+docker compose run --rm real-discount watch --once
+```
+
+Start the monitor in the background after the login succeeds:
+
+```sh
+docker compose up -d
+docker compose logs -f
+```
+
+Stop it with `docker compose down`. The host `data` directory survives
+container replacement. To update later, run `docker compose pull` followed
+by `docker compose up -d`.
+
+### Move an existing local session to Docker
+
+Stop the local monitor before copying its files. Copy `telegram-user.session`
+(or the session named in your `.env`), `.telegram-group-binding.json`, and the
+entire `results` directory into `data`, preserving their names. For example,
+`results/telegram-inbox.sqlite3` becomes `data/results/telegram-inbox.sqlite3`.
+Include any SQLite journal/WAL files and session sidecar files if present.
+Keep `.env` beside `compose.yaml`, then apply the Linux ownership command
+above if needed. This preserves the login and processed-message state.
+Do not run the local and Docker monitors simultaneously.
+
+Without Docker, paths continue to use the repository directory by default.
+To choose another data directory, set `REAL_DISCOUNT_DATA_DIR` in the process
+environment before starting the monitor.
+
+### Verify the image locally
+
+```sh
+docker build --target test -t real-discount:test .
+docker compose build
+docker compose run --rm real-discount --help
+```
