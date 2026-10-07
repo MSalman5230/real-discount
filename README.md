@@ -61,15 +61,15 @@ after a reboot.
 ## Docker
 
 GitHub Actions builds and tests a Linux/amd64 image on every push to
-`master`, then publishes it to GitHub Container Registry:
+`main`, then publishes it to GitHub Container Registry:
 
 ```text
 ghcr.io/msalman5230/real-discount:latest
-ghcr.io/msalman5230/real-discount:master
+ghcr.io/msalman5230/real-discount:main
 ghcr.io/msalman5230/real-discount:sha-<commit>
 ```
 
-Pull requests targeting `master` build and test without publishing.
+Pull requests targeting `main` build and test without publishing.
 Publishing uses the
 repository's automatic `GITHUB_TOKEN` with `packages: write`; no Docker Hub
 account or additional repository secret is needed.
