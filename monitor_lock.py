@@ -10,8 +10,15 @@ class MonitorLock:
         self.file = None
 
     def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = self.path.open("a+b")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.file = self.path.open("a+b")
+        except PermissionError:
+            identity = (f"UID/GID {os.getuid()}:{os.getgid()}" if hasattr(os, "getuid")
+                        else "the current user")
+            raise ValueError(f"Cannot write monitor lock '{self.path}'. Ensure the data "
+                             f"directory and existing lock file are writable by {identity}; "
+                             "Docker's /data mount must be read/write.") from None
         self.file.seek(0, 2)
         if self.file.tell() == 0:
             self.file.write(b"0")

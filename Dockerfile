@@ -16,17 +16,22 @@ RUN groupadd --gid 10001 app \
     && mkdir -p /data \
     && chown app:app /data
 
-COPY --chown=app:app deal_report.py message_queue.py monitor_lock.py price_history.py settings.py telegram_monitor.py ./
+COPY --chown=app:app deal_report.py docker_entrypoint.py message_queue.py monitor_lock.py price_history.py settings.py telegram_monitor.py ./
 COPY --chown=app:app pipelines/ ./pipelines/
 
 USER app
 
 FROM base AS test
 COPY --chown=app:app tests/ ./tests/
+USER root
+RUN python -m unittest discover -s tests -p test_docker_entrypoint.py -v
+USER app
 RUN python -m unittest discover -s tests -v
 
 FROM base AS runtime
+# The entrypoint repairs bind-mounted state, then drops to UID/GID 10001.
+USER root
 VOLUME ["/data"]
 STOPSIGNAL SIGINT
-ENTRYPOINT ["python", "telegram_monitor.py"]
+ENTRYPOINT ["python", "docker_entrypoint.py"]
 CMD ["watch"]

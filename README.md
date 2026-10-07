@@ -82,6 +82,50 @@ The Dockerfile and `compose.yaml` are in the repository root; the workflow
 is `.github/workflows/docker.yml`. Credentials, Telegram sessions and local
 results are excluded from the Docker build context.
 
+### Host the published image
+
+End users can use [compose.example.yaml](compose.example.yaml) without
+cloning or building the application. In a new hosting directory, save it as
+`compose.yaml`. Set the required Telegram values described in the Run section
+above in your shell environment or Docker hosting platform's environment
+variable settings. The example declares them inline under `environment`,
+using placeholders such as `${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN}`.
+Compose reports the named variable if a required value is missing or empty;
+optional settings have defaults in the placeholders.
+
+The example persists the session and checkpoint in `./data`. To use another
+location, edit the host side of `./data:/data`; keep the container side as
+`/data` and the mount read/write. No port mapping is needed. Leave the
+container user unset so startup can initialize data permissions before
+running the monitor as UID/GID 10001. For older image versions, follow
+[the permission repair instructions](#fix-permission-errors-on-an-existing-deployment).
+
+Pull the image and complete the first Telegram login interactively:
+
+```sh
+docker compose pull real-discount
+docker compose run --rm real-discount watch --once
+```
+
+Enter the login code and 2FA password if prompted. After login succeeds,
+start the background monitor:
+
+```sh
+docker compose up -d real-discount
+```
+
+When updating the image or changing environment values, pull and recreate the service:
+
+```sh
+docker compose pull real-discount
+docker compose up -d --force-recreate real-discount
+```
+
+The example disables stored container logs and puts temporary files in RAM.
+For console output, stop the background monitor and run it in the foreground
+using the commands in the example file. See First run below for private
+registry login and additional setup details.
+
 ### Memory and disk use
 
 The inbox holds at most 256 messages in RAM and pauses fetching while full.
@@ -113,8 +157,10 @@ default. Files are created only when explicitly requested with
 
 ### Configuration and directory mappings
 
-Keep `.env` beside `compose.yaml`. Compose reads it using `env_file` and
-passes its values into the container's environment. The app reads those
+For the repository's `compose.yaml`, keep `.env` beside it. Compose reads
+it using `env_file` and passes its values into the container's environment.
+The standalone `compose.example.yaml` instead declares inline environment
+placeholders, as described in Host the published image above. The app reads those
 values without requiring an `.env` volume mount. This also works when
 you launch Compose from another directory with `docker compose -f PATH/compose.yaml`.
 See [Docker's env_file documentation](https://docs.docker.com/reference/compose-file/services/#env_file).
@@ -166,12 +212,21 @@ Create the host data directory. On Windows, use PowerShell:
 New-Item -ItemType Directory -Force data
 ```
 
-On Linux, allow the container's user (UID/GID 10001) to write to it:
+On Linux, create the directory:
 
 ```sh
 mkdir -p data
-sudo chown -R 10001:10001 data
 ```
+
+The container starts with a short initialization step that gives its app user
+(UID/GID 10001) ownership and owner read/write access to the mounted data
+directory and its existing state files. It then drops root privileges before
+starting the Telegram monitor. Symlinks inside the data directory are not
+followed. Keep this mount dedicated to Real Discount state.
+
+If you override the container user, or your storage does not permit ownership
+changes, prepare the directory for that user's numeric UID/GID on the host.
+The `/data` mount must be read/write.
 
 Pull the published image:
 
@@ -205,6 +260,34 @@ Stop it with `docker compose down`. The host `data` directory survives
 container replacement. To update later, run `docker compose pull` followed
 by `docker compose up -d`.
 
+### Fix permission errors on an existing deployment
+
+`Permission denied: '/data/.telegram-monitor.lock'` means the running user
+cannot write the mounted directory or an existing lock file. Bind mounts use
+the host directory's permissions, hiding the ownership set by the Dockerfile.
+See [Docker's bind-mount documentation](https://docs.docker.com/engine/storage/bind-mounts/#bind-mounting-over-existing-data).
+
+For an existing image that does not yet include startup initialization, stop
+the monitor and repair its dedicated host data directory:
+
+```sh
+docker compose stop real-discount
+sudo chown -R 10001:10001 ./data
+sudo chmod -R u+rwX ./data
+docker compose up -d real-discount
+```
+
+Replace `./data` with the actual host path mapped to `/data`, for example
+`/mnt/user/appdata/real-discount` on Unraid. Keep the saved session and
+checkpoint files. Repair their permissions along with the lock file.
+
+After an image containing the startup fix is published, pull and recreate:
+
+```sh
+docker compose pull real-discount
+docker compose up -d --force-recreate real-discount
+```
+
 ### Move an existing local session to Docker
 
 Stop the local monitor before copying its files. Copy `telegram-user.session`
@@ -214,8 +297,8 @@ into `data`. Copy `results/telegram-read-state.json` and the previous
 Include the inbox's SQLite journal/WAL files and session sidecar files
 if present. Saved graphs, reports, captions and `telegram-state.json`
 do not need to be copied.
-Keep `.env` beside `compose.yaml`, then apply the Linux ownership command
-above if needed. This preserves the login and processed-message state.
+Keep `.env` beside `compose.yaml`; startup initialization repairs ownership
+of the copied files. This preserves the login and processed-message state.
 Do not run the local and Docker monitors simultaneously.
 
 On the first upgraded run, the previous SQLite inbox is read to recover the

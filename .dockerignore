@@ -5,6 +5,7 @@
 !requirements.txt
 !requirements-telegram.txt
 !deal_report.py
+!docker_entrypoint.py
 !message_queue.py
 !monitor_lock.py
 !price_history.py
