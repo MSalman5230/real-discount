@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.env
+*.session
+*.session-journal
+results/telegram-state.json
+.mpl-cache/
+.telegram-group-binding.json
+results/telegram-read-state.json
+results/telegram-monitor*.log
+results/telegram-monitor.pid
+.telegram-monitor.lock
+results/telegram-inbox*.sqlite3*
+results/
