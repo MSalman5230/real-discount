@@ -98,20 +98,15 @@ def report_caption(result):
     lines = [
         name,
         "",
-        f"PriceHistory.app: {site.get('label') or 'Unavailable'}",
         f"Latest tracked price: INR {analysis['current_price']:,.2f}",
         f"{analysis['months']}-month time-weighted median: INR {analysis['time_weighted_median']:,.2f}",
         f"Drop vs usual price: {analysis['drop_percent']:.1f}%",
-        f"Your >{analysis['discount_threshold_percent']:g}% rule: {analysis['median_rule_verdict']}",
     ]
     if site.get("prediction_probability_percent") is not None:
         lines.append(f"Site's stated prediction: {site['prediction_probability_percent']:g}% chance price will {site['prediction_direction']}")
     elif site.get("chance_of_increase_percent") is not None:
         lines.append(f"Site's stated chance of increase: {site['chance_of_increase_percent']:g}%")
-    if site.get("possible_fluctuation_percent") is not None:
-        lines.append(f"Site's stated possible fluctuation: {site['possible_fluctuation_percent']:g}%")
-    lines += ["", f"As of {local_datetime(analysis['window_end']):%d %b %Y %H:%M} IST",
-              result["history_url"], result["product_url"]]
+    lines += ["", result["history_url"], "", result["product_url"]]
     return "\n".join(lines)
 
 
