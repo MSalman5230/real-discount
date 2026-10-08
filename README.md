@@ -2,12 +2,13 @@
 
 Polls only **DealAlerts🔔 Loot Deals** for new Amazon and Flipkart links.
 Uses PriceHistory.app's six-month time-weighted median to identify discounts.
-Sends you a Telegram graph, percentage drop and available buying assessment
+Sends you a Telegram album with the product photo, price-history graph and
+percentage drop, including any available price prediction,
 only when the price is **more than 20% below the median** (configurable).
 Messages are processed once, including across restarts.
 After downtime, catch-up is limited to unclaimed messages from the past
 30 minutes; older messages are skipped without scanning the entire backlog.
-Product histories, graphs and captions are processed in memory and released
+Product histories, photos, graphs and captions are processed in memory and released
 after sending; the monitor does not save report files or processed messages.
 
 ## Run
@@ -151,8 +152,16 @@ and additional setup details.
 ### Memory and disk use
 
 The inbox holds at most 256 messages in RAM and pauses fetching while full.
-Each graph is rendered directly into a memory buffer, uploaded to Telegram,
-then closed. Finished messages and processing details are discarded.
+Product photos come from the large image on the matched PriceHistory.app
+page, avoiding an extra Amazon or Flipkart page request. A photo is downloaded
+into a bounded memory buffer and sent first in a two-photo Telegram album,
+alongside the price-history graph and the deal caption. If the product image
+is missing, unavailable or invalid, the chart and caption are still sent.
+Each graph is rendered directly into a memory buffer. Photo and graph buffers
+are closed after sending, including on upload failure. No message text, links,
+product data, photos, graphs or captions are saved by the monitor. Finished
+messages and processing details are discarded. Console logs contain general
+status and exception types, never product identifiers, links or error payloads.
 
 The application persists only the Telegram login session, approved group
 binding, a lock file and a small JSON reading checkpoint. Docker manages the

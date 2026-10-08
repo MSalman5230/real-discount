@@ -4,14 +4,14 @@ import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import requests
 from PIL import Image
 
 from deal_report import analyse_history, main, render_graph, save_report
 from settings import Settings
-from telegram_monitor import TelegramBot
+from telegram_monitor import TelegramBot, download_product_image
 
 
 def example_report():
@@ -105,6 +105,135 @@ class MemoryReportTests(unittest.TestCase):
             self.assertEqual({item.suffix for item in Path(directory).iterdir()},
                              {".png", ".json", ".txt"})
             self.assertIn("Example deal", caption)
+
+
+class ProductPhotoTests(unittest.TestCase):
+    def source(self, payload=None):
+        if payload is None:
+            with BytesIO() as image_bytes, Image.new("RGBA", (30, 20), (255, 0, 0, 0)) as image:
+                image.save(image_bytes, format="PNG")
+                payload = image_bytes.getvalue()
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.headers = {"Content-Length": str(len(payload))}
+        response.iter_content.return_value = [payload]
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.get.return_value = response
+        return session, response
+
+    def test_photo_download_and_jpeg_conversion_do_not_write_to_disk(self):
+        session, response = self.source()
+        with (patch("telegram_monitor.make_session", return_value=session),
+              patch("builtins.open", side_effect=AssertionError("Unexpected file access")),
+              patch.object(Path, "mkdir", side_effect=AssertionError("Unexpected directory")),
+              download_product_image("https://images.price.tools/product.png") as photo):
+            self.assertEqual(photo.tell(), 0)
+            with Image.open(photo) as image:
+                image.load()
+                self.assertEqual(image.format, "JPEG")
+                self.assertEqual(image.size, (30, 20))
+                self.assertEqual(image.getpixel((0, 0)), (255, 255, 255))
+        self.assertTrue(photo.closed)
+        session.get.assert_called_once_with("https://images.price.tools/product.png",
+                                            stream=True, timeout=(5, 15))
+        response.__exit__.assert_called_once()
+        session.__exit__.assert_called_once()
+
+    def test_invalid_or_oversized_photos_are_omitted(self):
+        for case in ["invalid", "header_limit", "stream_limit", "dimensions"]:
+            with self.subTest(case=case):
+                session, response = self.source(b"not an image")
+                if case == "header_limit":
+                    response.headers["Content-Length"] = "10000001"
+                elif case == "stream_limit":
+                    response.headers = {}
+                    response.iter_content.return_value = [b"x" * 65536] * 153
+                elif case == "dimensions":
+                    with BytesIO() as payload, Image.new("RGB", (401, 20)) as image:
+                        image.save(payload, format="PNG")
+                        session, response = self.source(payload.getvalue())
+                with patch("telegram_monitor.make_session", return_value=session), patch("builtins.print"):
+                    self.assertIsNone(download_product_image("https://images.price.tools/product.jpg"))
+                response.__exit__.assert_called_once()
+                session.__exit__.assert_called_once()
+
+    def test_failed_download_omits_photo_and_missing_url_does_not_request(self):
+        session, response = self.source()
+        response.raise_for_status.side_effect = requests.HTTPError("not found")
+        with patch("telegram_monitor.make_session", return_value=session), patch("builtins.print"):
+            self.assertIsNone(download_product_image("https://images.price.tools/missing.jpg"))
+        with patch("telegram_monitor.make_session") as transport:
+            self.assertIsNone(download_product_image(None))
+        transport.assert_not_called()
+
+    def test_album_upload_uses_memory_attachments_and_releases_the_product_photo(self):
+        bot = TelegramBot.__new__(TelegramBot)
+        bot.base = "https://example.invalid/"
+        bot.session = Mock()
+        uploaded = []
+
+        def post(url, data, files, timeout):
+            self.assertTrue(url.endswith("sendMediaGroup"))
+            import json
+            media = json.loads(data["media"])
+            self.assertEqual(media, [{"type": "photo", "media": "attach://product", "caption": "deal caption"},
+                                     {"type": "photo", "media": "attach://graph"}])
+            self.assertEqual(data["chat_id"], "private")
+            uploaded.append(requests.Request("POST", url, data=data, files=files).prepare().body)
+            response = Mock()
+            response.json.return_value = {"ok": True, "result": [{"message_id": 1}, {"message_id": 2}]}
+            return response
+
+        bot.session.post.side_effect = post
+        photo = BytesIO(b"product jpeg in memory")
+        with (BytesIO(b"chart png in memory") as graph,
+              patch("telegram_monitor.download_product_image", return_value=photo),
+              patch.object(Path, "open", side_effect=AssertionError("Unexpected file access"))):
+            graph.seek(0, 2)
+            result = bot.send_report("private", graph, "deal caption", "https://images.price.tools/product.jpg")
+            self.assertEqual(result, [{"message_id": 1}, {"message_id": 2}])
+            self.assertFalse(graph.closed)
+            self.assertTrue(photo.closed)
+        self.assertTrue(graph.closed)
+        self.assertIn(b"product jpeg in memory", uploaded[0])
+        self.assertIn(b"chart png in memory", uploaded[0])
+        self.assertIn(b'filename="product.jpg"', uploaded[0])
+        self.assertIn(b'filename="deal-6months.png"', uploaded[0])
+
+    def test_album_failure_still_releases_the_product_photo(self):
+        bot = TelegramBot.__new__(TelegramBot)
+        photo = BytesIO(b"product")
+        with (BytesIO(b"chart") as graph,
+              patch("telegram_monitor.download_product_image", return_value=photo),
+              patch.object(bot, "call", side_effect=ValueError("upload failed"))):
+            with self.assertRaisesRegex(ValueError, "upload failed"):
+                bot.send_report("private", graph, "caption", "https://images.price.tools/product.jpg")
+            self.assertFalse(graph.closed)
+            self.assertTrue(photo.closed)
+        self.assertTrue(graph.closed)
+
+    def test_photo_download_failure_still_sends_the_chart_with_caption(self):
+        bot = TelegramBot.__new__(TelegramBot)
+        with (BytesIO(b"chart") as graph,
+              patch("telegram_monitor.download_product_image", return_value=None),
+              patch.object(bot, "call", return_value={"message_id": 1}) as send):
+            bot.send_report("private", graph, "caption", "https://images.price.tools/missing.jpg")
+            send.assert_called_once_with("sendPhoto", {"chat_id": "private", "caption": "caption"},
+                                         {"photo": ("deal-6months.png", graph, "image/png")})
+
+    def test_long_album_caption_is_also_sent_as_text(self):
+        bot = TelegramBot.__new__(TelegramBot)
+        photo = BytesIO(b"product")
+        caption = "x" * 1100
+        with (BytesIO(b"chart") as graph,
+              patch("telegram_monitor.download_product_image", return_value=photo),
+              patch.object(bot, "call", return_value=[]) as send,
+              patch("telegram_monitor.time.sleep")):
+            bot.send_report("private", graph, caption, "https://images.price.tools/product.jpg")
+        self.assertEqual([call.args[0] for call in send.call_args_list], ["sendMediaGroup", "sendMessage"])
+        self.assertEqual(send.call_args_list[1].args[1]["text"], caption)
+        self.assertTrue(photo.closed)
 
 
 if __name__ == "__main__":

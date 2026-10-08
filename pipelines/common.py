@@ -3,6 +3,7 @@
 import math
 import re
 from datetime import datetime
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -107,6 +108,7 @@ def build_result(input_url, product_url, product_id, store, soup, data, page_url
         "input_url": input_url, "product_url": product_url, "product_id": product_id,
         "store": store, "currency": "INR", "history_url": page_url,
         "product_name": heading.get_text(" ", strip=True) if heading else search.get("name", product_id),
+        "product_image_url": extract_product_image_url(soup, page_url),
         "pricehistory_assessment": extract_assessment(soup),
         "scope": "All records collected by PriceHistory.app.",
         "summary": {
@@ -123,6 +125,28 @@ def build_result(input_url, product_url, product_id, store, soup, data, page_url
         "history": {"Price": prices, "OfferPrice": normalize_points(history.get("OfferPrice"))},
         "source_statistics": stats,
     }
+
+
+def extract_product_image_url(soup, page_url):
+    """Use the product's large sharing image, then its main product card."""
+    candidates = [tag.get("content") for tag in soup.select(
+        'meta[property="og:image"], meta[name="twitter:image"]')]
+    image = soup.select_one("img.card-img-top")
+    if image is not None:
+        candidates += [image.get("data-src"), image.get("src")]
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        try:
+            url = urljoin(page_url, candidate.strip())
+            parts = urlsplit(url)
+            if (parts.scheme in {"http", "https"} and parts.hostname
+                    and not parts.username and not parts.password
+                    and "/assets/" not in parts.path and "placeholder" not in parts.path.lower()):
+                return url
+        except ValueError:
+            continue
+    return None
 
 
 def page_header(scripts, name):

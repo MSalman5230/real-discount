@@ -1,7 +1,8 @@
 import asyncio
 import json
 import sqlite3
-from io import BytesIO
+from contextlib import redirect_stderr, redirect_stdout
+from io import BytesIO, StringIO
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,8 @@ from deal_report import exceeds_threshold
 from message_queue import MessageQueue
 from monitor_lock import MonitorLock
 from pipelines import fetch_history
-from pipelines.common import build_result, json_object
+from pipelines.amazon import normalize as normalize_amazon
+from pipelines.common import build_result, extract_product_image_url, json_object
 from pipelines.errors import PriceHistoryError
 from pipelines.flipkart import canonical_flipkart_url, normalize
 from settings import Settings, read_settings
@@ -99,11 +101,12 @@ class ThresholdTests(unittest.TestCase):
         processor = DeliveryProcessor.__new__(DeliveryProcessor)
         processor.bot = Mock()
         processor.recipient = 'private'
-        result = {'product_id': 'PRODUCT', 'six_month_analysis': {'median_rule_verdict': 'BUY', 'drop_percent': 26}}
+        result = {'product_id': 'PRODUCT', 'product_image_url': 'https://images.price.tools/product.jpg',
+                  'six_month_analysis': {'median_rule_verdict': 'BUY', 'drop_percent': 26}}
         url = 'https://fkrt.co/good'
         graph = BytesIO(b'png bytes')
         uploaded = []
-        processor.bot.send_report.side_effect = lambda recipient, photo, caption: uploaded.append(photo.read())
+        processor.bot.send_report.side_effect = lambda recipient, photo, caption, **kwargs: uploaded.append(photo.read())
         with patch('telegram_monitor.read_settings', return_value=Settings(threshold=25)), \
              patch('telegram_monitor.prepare_report', return_value=result) as prepare, \
              patch('telegram_monitor.report_caption', return_value='caption'), \
@@ -112,7 +115,8 @@ class ThresholdTests(unittest.TestCase):
              patch.object(Path, 'mkdir', side_effect=AssertionError('Unexpected directory')):
             outcome = processor.process(-100123, 1, [url, url])
         prepare.assert_called_once_with(url, 6, 25)
-        processor.bot.send_report.assert_called_once_with('private', graph, 'caption')
+        processor.bot.send_report.assert_called_once_with(
+            'private', graph, 'caption', product_image_url=result['product_image_url'])
         self.assertEqual(uploaded, [b'png bytes'])
         self.assertTrue(graph.closed)
         self.assertEqual(outcome[0]['status'], 'sent')
@@ -131,6 +135,57 @@ class ThresholdTests(unittest.TestCase):
             outcomes = processor.process(-100123, 1, ['https://fkrt.co/first', 'https://fkrt.co/second'])
         self.assertEqual([item['status'] for item in outcomes], ['failed', 'sent'])
         self.assertTrue(all(graph.closed for graph in graphs))
+
+
+    def test_product_identifiers_and_error_payloads_do_not_reach_console_logs(self):
+        processor = DeliveryProcessor.__new__(DeliveryProcessor)
+        processor.bot = None
+        processor.recipient = 'private'
+        product_id = 'PRIVATE-PRODUCT-CODE'
+        url = 'https://www.amazon.in/dp/PRIVATE-LINK'
+        result = {'product_id': product_id,
+                  'six_month_analysis': {'median_rule_verdict': 'BUY', 'drop_percent': 26}}
+        output = StringIO()
+        with (patch('telegram_monitor.read_settings', return_value=Settings()),
+              patch('telegram_monitor.prepare_report', side_effect=[result, PriceHistoryError(url)]),
+              patch('telegram_monitor.report_caption', return_value='private message caption'),
+              patch('telegram_monitor.render_graph', return_value=BytesIO(b'chart')),
+              redirect_stdout(output), redirect_stderr(output)):
+            processor.process(-100123, 1, [url, 'https://fkrt.co/second'])
+        logs = output.getvalue()
+        for private_value in [product_id, url, 'private message caption']:
+            self.assertNotIn(private_value, logs)
+        self.assertIn('Prepared report.', logs)
+        self.assertIn('PriceHistoryError', logs)
+
+
+class ProductImageExtractionTests(unittest.TestCase):
+    def test_both_store_pipelines_use_the_large_product_metadata_image(self):
+        soup = BeautifulSoup('<h1>Product</h1><meta property="og:image" '
+                             'content="https://images.price.tools/large.jpg">'
+                             '<img class="card-img-top" src="https://images.price.tools/medium.jpg">',
+                             'html.parser')
+        data = {'Price': {'Price': 700}, 'History': {'Price': [{'x': '2026-01-01', 'y': 1000}]}}
+        for adapter, url in [(normalize_amazon, 'https://www.amazon.in/dp/B094QSY1NC'),
+                             (normalize, 'https://www.flipkart.com/example/p/itmabc?pid=SFFFBPPPH8NDREHH')]:
+            with self.subTest(url=url):
+                result = adapter(url, url, soup, data, 'https://pricehistory.app/p/example', {})
+                self.assertEqual(result['product_image_url'], 'https://images.price.tools/large.jpg')
+
+    def test_invalid_metadata_falls_back_to_the_main_lazy_product_image(self):
+        soup = BeautifulSoup('<meta property="og:image" content="https://[">'
+                             '<meta property="og:image" content="javascript:alert(1)">'
+                             '<img class="card-img-top" data-src="//images.price.tools/product.jpg" '
+                             'src="/assets/placeholder.png">', 'html.parser')
+        self.assertEqual(extract_product_image_url(soup, 'https://pricehistory.app/p/example'),
+                         'https://images.price.tools/product.jpg')
+
+    def test_missing_product_photo_does_not_use_a_logo_or_recommended_product(self):
+        for html in ['', '<img class="card-img-top" src="/assets/images/pricehistory-app-logo.png">',
+                     '<img class="lazy" data-src="https://images.price.tools/other-product.jpg">']:
+            with self.subTest(html=html):
+                self.assertIsNone(extract_product_image_url(BeautifulSoup(html, 'html.parser'),
+                                                           'https://pricehistory.app/p/example'))
 
 
 class InboxTests(unittest.TestCase):

@@ -251,7 +251,8 @@ def main():
                 print("No Telegram alert: drop does not exceed the configured threshold.")
                 return
             with render_graph(result) as graph:
-                TelegramBot().send_report(recipient, graph, caption)
+                TelegramBot().send_report(recipient, graph, caption,
+                                          product_image_url=result.get("product_image_url"))
             print("Report sent to Telegram.")
     except (ValueError, PriceHistoryError) as exc:
         parser.exit(1, f"Error: {exc}\n")
